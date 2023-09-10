@@ -26,8 +26,8 @@ void mem_init(void)
 {
     /* allocate the storage we will use to model the available VM */
     if ((mem_start_brk = (char *)malloc(MAX_HEAP)) == NULL) {
-	fprintf(stderr, "mem_init_vm: malloc error\n");
-	exit(1);
+        fprintf(stderr, "mem_init_vm: malloc error\n");
+        exit(1);
     }
 
     mem_max_addr = mem_start_brk + MAX_HEAP;  /* max legal heap address */
@@ -59,12 +59,19 @@ void *mem_sbrk(int incr)
 {
     char *old_brk = mem_brk;
 
+    /*
+    1. 음수인 경우 메모리 축소를 의미하기 때문에 지원하지 않는다.
+    2. 할당 가능한 최대 주소를 초과하게 되면 메모리를 더 이상 할당할 수 없다.
+    */
     if ( (incr < 0) || ((mem_brk + incr) > mem_max_addr)) {
-	errno = ENOMEM;
-	fprintf(stderr, "ERROR: mem_sbrk failed. Ran out of memory...\n");
-	return (void *)-1;
+        errno = ENOMEM;    /* #define ENOMEM 12 - Out of memory */
+        fprintf(stderr, "ERROR: mem_sbrk failed. Ran out of memory...\n");
+        return (void *)-1;
     }
+
+    /* 메모리를 할당 & 할당 이전의 시작 주소를 반환 */
     mem_brk += incr;
+    
     return (void *)old_brk;
 }
 

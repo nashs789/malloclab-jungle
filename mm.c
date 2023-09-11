@@ -14,6 +14,7 @@
 #include <assert.h>
 #include <unistd.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include "mm.h"
 #include "memlib.h"
@@ -80,13 +81,24 @@ Example)
 typedef unsigned long dword_t;
 typedef char* byte_p;
 
+static void* g_next_p;
+
 static void *heap_listp;
 static void *extend_heap(size_t words);
 static void *coalesce(void *ptr);
 static void *find_fit(size_t asize);
 static void place(void *ptr, size_t asize);
 static void* first_fit(size_t asize);
+static void* next_fit(size_t asize);
+size_t *resize(size_t size);
 dword_t __offset(void *p);
+
+static size_t __get_size(void *p) { return GET_SIZE(p); }
+static bool __gel_alloc(void *p) { return GET_ALLOC(p); }
+static byte_p __get_h_p(void *bp) { return HDRP(bp); }
+static byte_p __get_f_p(void *bp) { return FTRP(bp); }
+static void* __get_next_p(void *bp) { return NEXT_BLKP(bp); }
+static void* __get_prev_p(void *bp) { return PREV_BLKP(bp); }
 
 /* 
  * mm_init - initialize the malloc package.
@@ -104,6 +116,7 @@ int mm_init(void){
     /* Epilogue block은 Header(4 Bytes)로 구성된다. + Prologue, Epilogue는 초기화 과정에서 생성되며 절대 반환하지 않음*/
     PUT(heap_listp + (3 * WSIZE), PACK(0, 1));     /* Epilogue header */
     heap_listp += (2 * WSIZE);
+    g_next_p = heap_listp;
     
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
     if (extend_heap(CHUNKSIZE / WSIZE) == NULL){
@@ -118,44 +131,31 @@ int mm_init(void){
  *     Always allocate a block whose size is a multiple of the alignment.
  */
 void *mm_malloc(size_t size) {
-    size_t asize;       /* Adjusted block size */
-    size_t extendsize;  /* Amount to extend heap if no fit */
-    void *bp;
-    
     /* Ignore spurious requests */
     if (size == 0) {
         return NULL;
     } 
-    
-    /* Adjust block size to include overhead and alignment reqs. */
-    if (size <= DSIZE) {
-        asize = 2 * DSIZE;    /* 최소 사이즈 만족도 하지 못하는 경우 최소 사이즈로 변환 */
-    } else {
-        /*
-        Examle) size = 20
-        asize = DSIZE * ((20 + DSIZE + (DSIZE - 1)) / DSIZE)
-        asize = DSIZE * ((20 + 8 + 7) / 8)
-        asize = DSIZE * (35 / 8)
-        asize = DSIZE * 4
-        asize = 32
-        */
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
-    }
-    
+
+    size_t asize = resize(size);    /* Adjusted block size */
+    size_t extendsize;              /* Amount to extend heap if no fit */
+    void *bp;
+
     /* Search the free list for a fit */
-    bp = find_fit(asize);
-    if (bp != NULL) {
+    if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
+        
         return bp; 
     }
     
     /* No fit found. Get more memory and place the block */
-    extendsize = MAX(asize,CHUNKSIZE);
-    if ((bp = extend_heap(extendsize/WSIZE)) == NULL) {
+    extendsize = MAX(asize, CHUNKSIZE);
+
+    if ((bp = extend_heap(extendsize / WSIZE)) == NULL) {
         return NULL;
     }   
 
     place(bp, asize);
+
     return bp;
 }
 
@@ -170,11 +170,58 @@ void mm_free(void *bp) {
     coalesce(bp);
 }
 
+/* 최소 사이즈 만족도 하지 못하는 경우 최소 사이즈로 변환 */
+size_t *resize(size_t size) {
+    /*
+        Adjust block size to include overhead and alignment reqs.
+        
+        Examle) size = 20
+        asize = DSIZE * ((20 + DSIZE + (DSIZE - 1)) / DSIZE)
+        asize = DSIZE * ((20 + 8 + 7) / 8)
+        asize = DSIZE * (35 / 8)
+        asize = DSIZE * 4
+        asize = 32
+    */
+    
+    return size <= DSIZE ? 2 * DSIZE : DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+}
+
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
-void *mm_realloc(void *ptr, size_t size)
-{
+void *mm_realloc(void *ptr, size_t size) {
+    size_t cur_size = GET_SIZE(HDRP(ptr));
+    size_t nxt_size = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    size_t prv_size = GET_SIZE(FTRP(PREV_BLKP(ptr)));
+    bool isNxtAlloc = GET_ALLOC(HDRP(ptr));
+    bool isPrvAlloc = GET_ALLOC(FTRP(ptr));
+    dword_t packed = NULL;
+    size = resize(size);
+
+    // 과연 케이스 3개를 확인하면서 발생하는 overhead가 memcpy보다 utilization이 높을까?
+    if(!isPrvAlloc && isNxtAlloc && size <= cur_size + prv_size - DSIZE){
+        size += prv_size;
+
+        PUT(FTRP(ptr), PACK(cur_size, 0));
+        PUT(FTRP(PREV_BLKP(ptr)), PACK(size, 1));
+
+        return ptr;
+    } else if(isPrvAlloc && !isNxtAlloc && size <= cur_size + nxt_size - DSIZE){
+        size += nxt_size;
+
+        PUT(HDRP(ptr), PACK(cur_size, 0));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(size, 1));
+
+        return ptr;
+    } else if(!isNxtAlloc && !isPrvAlloc && size <= cur_size + nxt_size + prv_size - DSIZE){
+        PUT(FTRP(ptr), PACK(cur_size, 0));
+        PUT(FTRP(PREV_BLKP(ptr)), PACK(size, 1));
+        PUT(HDRP(ptr), PACK(cur_size, 0));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(size, 1));
+
+        return ptr;
+    }
+
     if (ptr == NULL) {
         return mm_malloc(size);
     }
@@ -197,14 +244,14 @@ void *mm_realloc(void *ptr, size_t size)
     }
 
     /*
-    function   : memcpy(destination, source, size_t)
-    path       : <string.h>
-    parameter  : ⚙︎ destination: 복사할 데이터가 위치할 메모리주소를 가르키는 포인터
-                 ⚙︎ source     : 복사할 데이터가 위치한 메모리주소를 가르키는 포인터
-                 ⚙︎ size_t     : 복사할 데이터의 길이 (Bytes)
-    description: source에 있는 원본 데이터를 size_t만큼 복사해 destination 주소로 복사
-    caution    : ⚙︎ size_t 가 char* 인 경우에는 문자열의 끝을 알리는 "\0" 까지 복사해야 하기 때문에 길이 + 1을 해준다.
-                 ⚙︎ desination과 source의 메모리 주소는 겹치면 안된다.
+        function   : memcpy(destination, source, size_t)
+        path       : <string.h>
+        parameter  : ⚙︎ destination: 복사할 데이터가 위치할 메모리주소를 가르키는 포인터
+                     ⚙︎ source     : 복사할 데이터가 위치한 메모리주소를 가르키는 포인터
+                     ⚙︎ size_t     : 복사할 데이터의 길이 (Bytes)
+        description: source에 있는 원본 데이터를 size_t만큼 복사해 destination 주소로 복사
+        caution    : ⚙︎ size_t 가 char* 인 경우에는 문자열의 끝을 알리는 "\0" 까지 복사해야 하기 때문에 길이 + 1을 해준다.
+                     ⚙︎ desination과 source의 메모리 주소는 겹치면 안된다.
     */      
     memcpy(new_ptr, ptr, csize); // ptr 위치에서 csize만큼의 크기를 new_ptr의 위치에 복사함
     mm_free(ptr); // 기존 ptr의 메모리는 할당 해제해줌
@@ -261,40 +308,47 @@ static void *coalesce(void *bp){
         bp = PREV_BLKP(bp);
     }
     
-    return bp; 
+    g_next_p = bp;
+    return bp;
 }
 
 static void* find_fit(size_t asize) {
-    first_fit(asize);
+    //first_fit(asize);
+    next_fit(asize);
 }
 
-static void* first_fit(size_t asize){
+static void* next_fit(size_t asize) {
     void *bp;
 
-    for(bp = (char*)heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+    for(bp = g_next_p; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
+        if(!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))){
+            g_next_p = bp;
+            return bp;
+        }
+    }
+
+    for(bp = heap_listp; bp < g_next_p; bp = NEXT_BLKP(bp)){
+        if(!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))){
+            g_next_p = bp;
             return bp;
         }
     }
 
     return NULL;
+}
 
-    /*
-    // 힙 메모리의 첫 번째 block의 header를 가르킨다. (prolog 있음을 생각)
-    void *bp = mem_heap_lo() + 2 * WSIZE;
+static void* first_fit(size_t asize) {
+    void *bp;
 
-    // bp는 현재 block의 header를 가르키며 순회한다. 메모리 끝에 도달하면 종료
-    while (GET_SIZE(HDRP(bp)) > 0) {
+    // bp의 초기 값은 힙 메모리의 시작 값이며, 에필로그의 값에 도달시 종료하게 된다.
+    for(bp = (char *)heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
         // block이 'allocated' 상태가 아니며 && 요청한 asize 크기보다 큰 경우
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {
+        if (!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))) {
             return bp;
         }
-        
-        bp = NEXT_BLKP(bp);
     }
 
     return NULL;
-    */
 }
 
 static void place(void *bp, size_t asize){
@@ -302,9 +356,9 @@ static void place(void *bp, size_t asize){
 
     /* 현재 block에서 할당할 block의 크기를 뺀 값을 free block 만들기 충분한 공간인지 확인 */
     /* 
-    ⚙︎ 2 * DSIZE인 이유: 
-    1. 최소 공간: header와 footer 각각의 공간을 나타내는 최소의 크기
-    2. 분할 조건: 위와 같이 최소 정렬 최소 사이즈를 맞춰주면 할당 후에도 정렬 조건에 맞는 Free 공간이 남아 있음을 보장
+        ⚙︎ 2 * DSIZE 인 이유: 
+        1. 최소 공간: header와 footer 각각의 공간을 나타내는 최소의 크기
+        2. 분할 조건: 위와 같이 최소 정렬 최소 사이즈를 맞춰주면 할당 후에도 정렬 조건에 맞는 Free 공간이 남아 있음을 보장
      */
     if ((csize - asize) >= (2 * DSIZE)) {
         // 현 메모리 block header, footer에서 asize 크기의 'allocate' block으로 설정

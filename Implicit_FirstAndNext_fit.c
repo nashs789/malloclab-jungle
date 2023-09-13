@@ -47,7 +47,6 @@ team_t team = {
 #define ALLOC 1
 #define WSIZE 4                                                             /* Word and header/footer size (bytes) */
 #define DSIZE 8                                                             /* Double word size (bytes)*/
-#define MIN_SIZE 16
 #define CHUNKSIZE (1 << 12)                                                 /* Extend heap by this amount (bytes) == 4096 */
 #define MAX(x, y) ( (x) > (y) ? (x) : (y))                                  /* 최대 값 확인*/
 #define PACK(size, alloc) ((size) | (alloc))                                /* Pack a size and allocated bit into a word */
@@ -72,38 +71,27 @@ Example)
 /* 할당 여부를 받는 매크로 함수: 0 or 1만 결과 값으로 나오게 되어있음 */
 #define GET_ALLOC(p) (GET(p) & 0x1)                                         /* Read Allocated fields from address p */
 /* 
-        |-- Prologue --|                     BP                                                         |-- Epilogue --|
-|----Header----|----Footer----|----Header----|-----Next-----|-----Prev-----|----Block----|----Footer----|----Header----|
-|----4 Byte----|----4 Byte----|----4 Byte----|----4 Byte----|----4 Byte----|----Block----|----4 Byte----|----4 Byte----|
+                              BP
+|----Footer----|----Header----|----Block----|----Footer----|
+|----4 Byte----|----4 Byte----|----Block----|----4 Byte----| 
 */
 #define HDRP(bp) ((char *)(bp) - WSIZE)                                     /* Given block ptr bp, compute address of its header */
 #define FTRP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)) - DSIZE)                /* Given block ptr bp, compute address of its footer */
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))     /* Given block ptr bp, compute address of next blocks */
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))     /* Given block ptr bp, compute address of previous blocks */
-#define NEXT_FREE(bp) (*(void **) bp)              // bp 주소에는 NEXT FREE 블록 주소값이 있음
-#define PREV_FREE(bp) (*(void **) (bp + WSIZE))    // bp + WSIZE 주소에는 PREV FREE 블록 주소값이 있음
 
 typedef unsigned long dword_t;
 typedef char* byte_p;
 
-/*
- * Global Variable
-*/
 static void *g_next_p;
 static char *heap_listp;
-static char *head;
 
-/*
- * Function Define
-*/
 static void *extend_heap(size_t words);
 static void *coalesce(void *ptr);
 static void *find_fit(size_t asize);
 static void place(void *ptr, size_t asize);
 static void *first_fit(size_t asize);
 static void *next_fit(size_t asize);
-static void add_free(void *bp);
-static void del_free(void *bp);
 size_t *resize(size_t size);
 dword_t __offset(void *p);
 
@@ -118,22 +106,18 @@ static void *__get_prev_p(void *bp) { return PREV_BLKP(bp); }
  * mm_init - initialize the malloc package.
  */
 int mm_init(void){
-    /* Pdding - Prologue Header - Prologue Footer - Free Header - Free Footer - Epilogue Header */
-    if ((heap_listp = mem_sbrk(6 * WSIZE)) == (void *)-1){
+    /* Create the initial empty heap */
+    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1){
         return -1;   
     }
 
-    PUT(heap_listp, 0);                                   /* Alignment padding */
+    PUT(heap_listp, 0);                                /* Alignment padding */
     /* Prologue block은 Header + Footer (8 Bytes)로 구성된다. */
-    PUT(heap_listp + (1 * WSIZE), PACK(MIN_SIZE, ALLOC)); /* Prologue header */
-    PUT(heap_listp + (2 * WSIZE), NULL);                  /* Next block addr */
-    PUT(heap_listp + (3 * WSIZE), NULL);                  /* Prev block addr */
-    PUT(heap_listp + (4 * WSIZE), PACK(MIN_SIZE, ALLOC)); /* Prologue footer */
+    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, ALLOC)); /* Prologue header */
+    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, ALLOC)); /* Prologue footer */
     /* Epilogue block은 Header(4 Bytes)로 구성된다. + Prologue, Epilogue는 초기화 과정에서 생성되며 절대 반환하지 않음*/
-    PUT(heap_listp + (5 * WSIZE), PACK(0, ALLOC));        /* Epilogue header */
-    
+    PUT(heap_listp + (3 * WSIZE), PACK(0, ALLOC));     /* Epilogue header */
     heap_listp += (2 * WSIZE);
-    head = heap_listp + (2 * WSIZE);
     g_next_p = heap_listp;
     
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
@@ -161,7 +145,7 @@ void *mm_malloc(size_t size) {
     /* Search the free list for a fit */
     if ((bp = find_fit(asize)) != NULL) {
         place(bp, asize);
-
+        
         return bp; 
     }
     
@@ -173,6 +157,7 @@ void *mm_malloc(size_t size) {
     }   
 
     place(bp, asize);
+
     return bp;
 }
 
@@ -215,6 +200,30 @@ void *mm_realloc(void *ptr, size_t size) {
     dword_t packed = NULL;
     size = resize(size);
 
+    // 과연 케이스 3개를 확인하면서 발생하는 overhead가 memcpy보다 utilization이 높을까?
+    if(!isPrvAlloc && isNxtAlloc && size <= cur_size + prv_size - DSIZE){
+        size += prv_size;
+
+        PUT(FTRP(ptr), PACK(cur_size, FREE));
+        PUT(FTRP(PREV_BLKP(ptr)), PACK(size, ALLOC));
+
+        return ptr;
+    } else if(isPrvAlloc && !isNxtAlloc && size <= cur_size + nxt_size - DSIZE){
+        size += nxt_size;
+
+        PUT(HDRP(ptr), PACK(cur_size, FREE));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(size, ALLOC));
+
+        return ptr;
+    } else if(!isNxtAlloc && !isPrvAlloc && size <= cur_size + nxt_size + prv_size - DSIZE){
+        PUT(FTRP(ptr), PACK(cur_size, FREE));
+        PUT(FTRP(PREV_BLKP(ptr)), PACK(size, ALLOC));
+        PUT(HDRP(ptr), PACK(cur_size, FREE));
+        PUT(HDRP(NEXT_BLKP(ptr)), PACK(size, ALLOC));
+
+        return ptr;
+    }
+
     if (ptr == NULL) {
         return mm_malloc(size);
     }
@@ -248,6 +257,7 @@ void *mm_realloc(void *ptr, size_t size) {
     */      
     memcpy(new_ptr, ptr, csize); // ptr 위치에서 csize만큼의 크기를 new_ptr의 위치에 복사함
     mm_free(ptr); // 기존 ptr의 메모리는 할당 해제해줌
+
     return new_ptr;
 }
 
@@ -265,10 +275,10 @@ static void *extend_heap(size_t words) {
     }
     
     /* Initialize free block header/footer and the epilogue header */
-    PUT(HDRP(bp), PACK(size, FREE)); /* Free block header */
-    PUT(FTRP(bp), PACK(size, FREE)); /* Free block footer */
+    PUT(HDRP(bp), PACK(size, FREE));      /* Free block header */
+    PUT(FTRP(bp), PACK(size, FREE));      /* Free block footer */
     /* 의문) 이전 에필로그 block은 초기화 안해주나? -> 어차피 header의 위치가 되면서 free block이 되니까 괜찮은걸로 보임 */
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, ALLOC)); /* New epilogue header */
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); /* New epilogue header */
 
     /* Coalesce if the previous block was free */
     return coalesce(bp);
@@ -280,16 +290,13 @@ static void *coalesce(void *bp){
     size_t size = GET_SIZE(HDRP(bp));
 
     if (prev_alloc && next_alloc) {            /* Case 1 - 둘 다 할당되어있는 케이스 */
-        add_free(bp);
         return bp;
     } else if(prev_alloc && !next_alloc) {     /* Case 2 - 앞 Alloc / 뒤 Free */
-        del_free(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp))); // 1. Get the previous block's size from its Header
 
-        PUT(HDRP(bp), PACK(size, FREE));          // 2. Set Header
-        PUT(FTRP(bp), PACK(size, FREE));          // 3. Set Footer
+        PUT(HDRP(bp), PACK(size, FREE));       // 2. Set Header
+        PUT(FTRP(bp), PACK(size, FREE));       // 3. Set Footer
     } else if(!prev_alloc && next_alloc) {     /* Case 3 - 앞 Free / 뒤 Alloc */
-        del_free(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
 
         PUT(FTRP(bp), PACK(size, FREE));
@@ -297,8 +304,6 @@ static void *coalesce(void *bp){
         bp = PREV_BLKP(bp);
     } else {                                   /* Case 4 - 앞 Free / 뒤 Free */
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-        del_free(PREV_BLKP(bp));
-        del_free(NEXT_BLKP(bp));
 
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, FREE));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, FREE));
@@ -306,19 +311,17 @@ static void *coalesce(void *bp){
     }
     
     g_next_p = bp;
-    add_free(bp);
     return bp;
 }
 
 static void* find_fit(size_t asize) {
-    first_fit(asize);
-    //next_fit(asize);
+    //first_fit(asize);
+    next_fit(asize);
 }
 
 static void* next_fit(size_t asize) {
     void *bp;
 
-    // Search 마지막 지점 -> Epilog
     for(bp = g_next_p; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
         if(!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))){
             g_next_p = bp;
@@ -326,7 +329,6 @@ static void* next_fit(size_t asize) {
         }
     }
 
-    // Prolog -> Search 마지막 지점
     for(bp = heap_listp; bp < g_next_p; bp = NEXT_BLKP(bp)){
         if(!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))){
             g_next_p = bp;
@@ -340,8 +342,10 @@ static void* next_fit(size_t asize) {
 static void* first_fit(size_t asize) {
     void *bp;
 
-    for(bp = head; GET_ALLOC(HDRP(bp)) != ALLOC; bp = NEXT_FREE(bp)){
-        if (asize <= GET_SIZE(HDRP(bp))) {
+    // bp의 초기 값은 힙 메모리의 시작 값이며, 에필로그의 값에 도달시 종료하게 된다.
+    for(bp = (char *)heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
+        // block이 'allocated' 상태가 아니며 && 요청한 asize 크기보다 큰 경우
+        if (!GET_ALLOC(HDRP(bp)) && asize <= GET_SIZE(HDRP(bp))) {
             return bp;
         }
     }
@@ -351,7 +355,6 @@ static void* first_fit(size_t asize) {
 
 static void place(void *bp, size_t asize){
     size_t csize = GET_SIZE(HDRP(bp));
-    del_free(bp);
 
     /* 현재 block에서 할당할 block의 크기를 뺀 값을 free block 만들기 충분한 공간인지 확인 */
     /* 
@@ -364,35 +367,12 @@ static void place(void *bp, size_t asize){
         PUT(HDRP(bp), PACK(asize, ALLOC));
         PUT(FTRP(bp), PACK(asize, ALLOC));
         // 현 메모리 다음 block header, footer asize 크기의 남은 공간의 크기와 'free' block으로 설정
-        bp = NEXT_BLKP(bp);
-        PUT(HDRP(bp), PACK((csize - asize), FREE));
-        PUT(FTRP(bp), PACK((csize - asize), FREE));
-
-        add_free(bp);
+        PUT(HDRP(NEXT_BLKP(bp)), PACK((csize - asize), FREE));
+        PUT(FTRP(NEXT_BLKP(bp)), PACK((csize - asize), FREE));
     } else{     // 남은 공간이 충분하지 않은 경우
         // 현재 메모리 block의 header, footer 모두 'allocated' 로 설정한다.
         PUT(HDRP(bp), PACK(csize, ALLOC));
         PUT(FTRP(bp), PACK(csize, ALLOC));
-    }
-}
-
-void add_free(void *bp){
-    // 새로 들어온 block 관계 설정
-    NEXT_FREE(bp) = head;
-    PREV_FREE(bp) = NULL;
-    // 기존에 head였던 block 관계 설정
-    PREV_FREE(head) = bp;
-    // root 변경
-    head = bp;
-}
-
-void del_free(void *bp){
-    if(bp == head){
-        PREV_FREE(NEXT_FREE(bp)) = NULL;
-        head = NEXT_FREE(bp);
-    } else {
-        NEXT_FREE(PREV_FREE(bp)) = NEXT_FREE(bp);
-        PREV_FREE(NEXT_FREE(bp)) = PREV_FREE(bp);
     }
 }
 

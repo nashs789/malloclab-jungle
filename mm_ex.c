@@ -90,8 +90,8 @@ typedef char* byte_p;
  * Global Variable
 */
 static void *g_next_p;
-static void *heap_listp;
-static void *head;
+static char *heap_listp;
+static char *head;
 
 /*
  * Function Define
@@ -123,16 +123,17 @@ int mm_init(void){
         return -1;   
     }
 
-    PUT(heap_listp, 0);                            /* Alignment padding */
+    PUT(heap_listp, 0);                                   /* Alignment padding */
     /* Prologue block은 Header + Footer (8 Bytes)로 구성된다. */
     PUT(heap_listp + (1 * WSIZE), PACK(MIN_SIZE, ALLOC)); /* Prologue header */
     PUT(heap_listp + (2 * WSIZE), NULL);                  /* Next block addr */
     PUT(heap_listp + (3 * WSIZE), NULL);                  /* Prev block addr */
     PUT(heap_listp + (4 * WSIZE), PACK(MIN_SIZE, ALLOC)); /* Prologue footer */
     /* Epilogue block은 Header(4 Bytes)로 구성된다. + Prologue, Epilogue는 초기화 과정에서 생성되며 절대 반환하지 않음*/
-    PUT(heap_listp + (5 * WSIZE), PACK(0, ALLOC));     /* Epilogue header */
+    PUT(heap_listp + (5 * WSIZE), PACK(0, ALLOC));        /* Epilogue header */
     
     heap_listp += (2 * WSIZE);
+    head = heap_listp + (2 * WSIZE);
     g_next_p = heap_listp;
     
     /* Extend the empty heap with a free block of CHUNKSIZE bytes */
@@ -181,8 +182,8 @@ void *mm_malloc(size_t size) {
 void mm_free(void *bp) {
     size_t size = GET_SIZE(HDRP(bp));
 
-    PUT(HDRP(bp), PACK(size, 0));
-    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(bp), PACK(size, FREE));
+    PUT(FTRP(bp), PACK(size, FREE));
     coalesce(bp);
 }
 
@@ -282,13 +283,13 @@ static void *coalesce(void *bp){
         add_free(bp);
         return bp;
     } else if(prev_alloc && !next_alloc) {     /* Case 2 - 앞 Alloc / 뒤 Free */
-        del_free(NEXT_FREE(bp));
+        del_free(NEXT_BLKP(bp));
         size += GET_SIZE(HDRP(NEXT_BLKP(bp))); // 1. Get the previous block's size from its Header
 
         PUT(HDRP(bp), PACK(size, FREE));          // 2. Set Header
         PUT(FTRP(bp), PACK(size, FREE));          // 3. Set Footer
     } else if(!prev_alloc && next_alloc) {     /* Case 3 - 앞 Free / 뒤 Alloc */
-        del_free(PREV_FREE(bp));
+        del_free(PREV_BLKP(bp));
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
 
         PUT(FTRP(bp), PACK(size, FREE));
@@ -296,8 +297,8 @@ static void *coalesce(void *bp){
         bp = PREV_BLKP(bp);
     } else {                                   /* Case 4 - 앞 Free / 뒤 Free */
         size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
-        del_free(PREV_FREE(bp));
-        del_free(NEXT_FREE(bp));
+        del_free(PREV_BLKP(bp));
+        del_free(NEXT_BLKP(bp));
 
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, FREE));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, FREE));
@@ -310,8 +311,8 @@ static void *coalesce(void *bp){
 }
 
 static void* find_fit(size_t asize) {
-    //first_fit(asize);
-    next_fit(asize);
+    first_fit(asize);
+    //next_fit(asize);
 }
 
 static void* next_fit(size_t asize) {
@@ -339,7 +340,7 @@ static void* next_fit(size_t asize) {
 static void* first_fit(size_t asize) {
     void *bp;
 
-    for(bp = (char *)heap_listp; GET_ALLOC(HDRP(bp)) != ALLOC; bp = NEXT_FREE(bp)){
+    for(bp = head; GET_ALLOC(HDRP(bp)) != ALLOC; bp = NEXT_FREE(bp)){
         if (asize <= GET_SIZE(HDRP(bp))) {
             return bp;
         }
@@ -350,6 +351,7 @@ static void* first_fit(size_t asize) {
 
 static void place(void *bp, size_t asize){
     size_t csize = GET_SIZE(HDRP(bp));
+    del_free(bp);
 
     /* 현재 block에서 할당할 block의 크기를 뺀 값을 free block 만들기 충분한 공간인지 확인 */
     /* 
@@ -359,18 +361,19 @@ static void place(void *bp, size_t asize){
      */
     if ((csize - asize) >= (2 * DSIZE)) {
         // 현 메모리 block header, footer에서 asize 크기의 'allocate' block으로 설정
-        PUT(HDRP(bp), PACK(asize, 1));
-        PUT(FTRP(bp), PACK(asize, 1));
+        PUT(HDRP(bp), PACK(asize, ALLOC));
+        PUT(FTRP(bp), PACK(asize, ALLOC));
         // 현 메모리 다음 block header, footer asize 크기의 남은 공간의 크기와 'free' block으로 설정
-        PUT(HDRP(NEXT_BLKP(bp)), PACK((csize - asize), 0));
-        PUT(FTRP(NEXT_BLKP(bp)), PACK((csize - asize), 0));
+        bp = NEXT_BLKP(bp);
+        PUT(HDRP(bp), PACK((csize - asize), FREE));
+        PUT(FTRP(bp), PACK((csize - asize), FREE));
+
+        add_free(bp);
     } else{     // 남은 공간이 충분하지 않은 경우
         // 현재 메모리 block의 header, footer 모두 'allocated' 로 설정한다.
-        PUT(HDRP(bp), PACK(csize, 1));
-        PUT(FTRP(bp), PACK(csize, 1));
+        PUT(HDRP(bp), PACK(csize, ALLOC));
+        PUT(FTRP(bp), PACK(csize, ALLOC));
     }
-
-    del_free(bp);
 }
 
 void add_free(void *bp){
